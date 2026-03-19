@@ -1,0 +1,111 @@
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: cluster-resource-quotas
+spec:
+  schema:
+    apiVersion: v1alpha1
+    kind: ClusterResourceQuotas
+    scope: Cluster
+    spec:
+      teamName: string | required=true
+      description: string | default="Tracks aggregate quotas for a team."
+      budget: "map[string]string"
+    status:
+      quotaCount: ${string(size(quotas))}
+      totalHard:
+        requests:
+          cpu: ${string(int(quotas.map(q, quantity(string(q.spec.?hard.orValue({})[?'requests.cpu'].orValue('0'))).asApproximateFloat()).sum()))}
+          memory: ${string(int(quotas.map(q, quantity(string(q.spec.?hard.orValue({})[?'requests.memory'].orValue('0'))).asApproximateFloat()).sum()))}
+        limits:
+          cpu: ${string(int(quotas.map(q, quantity(string(q.spec.?hard.orValue({})[?'limits.cpu'].orValue('0'))).asApproximateFloat()).sum()))}
+          memory: ${string(int(quotas.map(q, quantity(string(q.spec.?hard.orValue({})[?'limits.memory'].orValue('0'))).asApproximateFloat()).sum()))}
+
+  resources:
+    # 1. Discover all ResourceQuotas labeled for this team (cross-namespace)
+    - id: quotas
+      externalRef:
+        apiVersion: v1
+        kind: ResourceQuota
+        metadata:
+          selector:
+            matchExpressions:
+              - key: team
+                operator: In
+                values: ["${schema.spec.teamName}"]
+
+    # 2. RBAC: Grant Kyverno permission to read ClusterResourceQuotas
+    - id: kyvernoRbac
+      template:
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRole
+        metadata:
+          name: kyverno:cluster-resource-quotas
+          labels:
+            rbac.kyverno.io/aggregate-to-admission-controller: "true"
+        rules:
+          - apiGroups: ["kro.run"]
+            resources: ["clusterresourcequotas"]
+            verbs: ["get", "list", "watch"]
+
+    # 3. Kyverno policy: Enforce team budget on new ResourceQuotas
+    - id: budgetPolicy
+      includeWhen:
+        - ${schema.spec.budget[?'requests.cpu'].orValue('0') != '0'}
+      template:
+        apiVersion: kyverno.io/v1
+        kind: ClusterPolicy
+        metadata:
+          name: validate-${schema.spec.teamName}-quota-budget
+        spec:
+          rules:
+            - name: check-team-total-does-not-exceed-budget
+              match:
+                any:
+                  - resources:
+                      kinds:
+                        - ResourceQuota
+                      operations:
+                        - CREATE
+                        - UPDATE
+                      selector:
+                        matchExpressions:
+                          - key: team
+                            operator: In
+                            values:
+                              - ${schema.spec.teamName}
+              context:
+                - name: team_name
+                  variable:
+                    jmesPath: "request.object.metadata.labels.team"
+                - name: team_budget
+                  apiCall:
+                    urlPath: "/apis/kro.run/v1alpha1/clusterresourcequotas/${schema.metadata.name}"
+                    jmesPath: "spec"
+                - name: other_team_quotas
+                  apiCall:
+                    urlPath: "/api/v1/resourcequotas?labelSelector=team%3D{{team_name}}&fieldSelector=metadata.name!%3D{{request.object.metadata.name}}"
+                    jmesPath: "items"
+                - name: current_cpu_usage
+                  variable:
+                    value: "{{ sum(other_team_quotas[*].spec.hard.\"requests.cpu\" || ['0']) | to_string(@) }}"
+                - name: current_mem_usage
+                  variable:
+                    value: "{{ sum(other_team_quotas[*].spec.hard.\"requests.memory\" || ['0']) | to_string(@) }}"
+              validate:
+                failureAction: Enforce
+                message: >-
+                  Team resource budget exceeded for '{{team_name}}'.
+                  Request for CPU '{{request.object.spec.hard."requests.cpu"}}' would bring total to {{ add(current_cpu_usage, request.object.spec.hard."requests.cpu") }},
+                  but the team budget is {{team_budget.budget."requests.cpu"}}.
+                  Request for Memory '{{request.object.spec.hard."requests.memory"}}' would bring total to {{ add(current_mem_usage, request.object.spec.hard."requests.memory") }},
+                  but the team budget is {{team_budget.budget."requests.memory"}}.
+                deny:
+                  conditions:
+                    any:
+                      - key: "{{ add(current_cpu_usage, request.object.spec.hard.\"requests.cpu\") }}"
+                        operator: GreaterThan
+                        value: "{{ team_budget.budget.\"requests.cpu\" }}"
+                      - key: "{{ add(current_mem_usage, request.object.spec.hard.\"requests.memory\") }}"
+                        operator: GreaterThan
+                        value: "{{ team_budget.budget.\"requests.memory\" }}"
