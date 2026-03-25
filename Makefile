@@ -1,5 +1,5 @@
 KIND_CLUSTER_NAME ?= kro-kyverno-demo
-KRO_VERSION ?= 0.9.0-rc1
+KRO_VERSION ?= 0.9.0
 KYVERNO_VERSION ?= 3.7.1
 
 KUBECTL ?= kubectl
