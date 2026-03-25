@@ -34,78 +34,60 @@ spec:
                 operator: In
                 values: ["${schema.spec.teamName}"]
 
-    # 2. RBAC: Grant Kyverno permission to read ClusterResourceQuotas
-    - id: kyvernoRbac
-      template:
-        apiVersion: rbac.authorization.k8s.io/v1
-        kind: ClusterRole
-        metadata:
-          name: kyverno:cluster-resource-quotas
-          labels:
-            rbac.kyverno.io/aggregate-to-admission-controller: "true"
-        rules:
-          - apiGroups: ["kro.run"]
-            resources: ["clusterresourcequotas"]
-            verbs: ["get", "list", "watch"]
-
-    # 3. Kyverno policy: Enforce team budget on new ResourceQuotas
+    # 2. Kyverno policy: Enforce team budget on new ResourceQuotas
     - id: budgetPolicy
       includeWhen:
-        - ${schema.spec.budget[?'requests.cpu'].orValue('0') != '0'}
+        - ${schema.spec.budget[?'requests.cpu'].orValue('0') != '0' || schema.spec.budget[?'requests.memory'].orValue('0') != '0'}
       template:
-        apiVersion: kyverno.io/v1
-        kind: ClusterPolicy
+        apiVersion: policies.kyverno.io/v1beta1
+        kind: ValidatingPolicy
         metadata:
-          name: validate-${schema.spec.teamName}-quota-budget
+          name: validate-quota-${schema.spec.teamName}
         spec:
-          rules:
-            - name: check-team-total-does-not-exceed-budget
-              match:
-                any:
-                  - resources:
-                      kinds:
-                        - ResourceQuota
-                      operations:
-                        - CREATE
-                        - UPDATE
-                      selector:
-                        matchExpressions:
-                          - key: team
-                            operator: In
-                            values:
-                              - ${schema.spec.teamName}
-              context:
-                - name: team_name
-                  variable:
-                    jmesPath: "request.object.metadata.labels.team"
-                - name: team_budget
-                  apiCall:
-                    urlPath: "/apis/kro.run/v1alpha1/clusterresourcequotas/${schema.metadata.name}"
-                    jmesPath: "spec"
-                - name: other_team_quotas
-                  apiCall:
-                    urlPath: "/api/v1/resourcequotas?labelSelector=team%3D{{team_name}}&fieldSelector=metadata.name!%3D{{request.object.metadata.name}}"
-                    jmesPath: "items"
-                - name: current_cpu_usage
-                  variable:
-                    value: "{{ sum(other_team_quotas[*].spec.hard.\"requests.cpu\" || ['0']) | to_string(@) }}"
-                - name: current_mem_usage
-                  variable:
-                    value: "{{ sum(other_team_quotas[*].spec.hard.\"requests.memory\" || ['0']) | to_string(@) }}"
-              validate:
-                failureAction: Enforce
-                message: >-
-                  Team resource budget exceeded for '{{team_name}}'.
-                  Request for CPU '{{request.object.spec.hard."requests.cpu"}}' would bring total to {{ add(current_cpu_usage, request.object.spec.hard."requests.cpu") }},
-                  but the team budget is {{team_budget.budget."requests.cpu"}}.
-                  Request for Memory '{{request.object.spec.hard."requests.memory"}}' would bring total to {{ add(current_mem_usage, request.object.spec.hard."requests.memory") }},
-                  but the team budget is {{team_budget.budget."requests.memory"}}.
-                deny:
-                  conditions:
-                    any:
-                      - key: "{{ add(current_cpu_usage, request.object.spec.hard.\"requests.cpu\") }}"
-                        operator: GreaterThan
-                        value: "{{ team_budget.budget.\"requests.cpu\" }}"
-                      - key: "{{ add(current_mem_usage, request.object.spec.hard.\"requests.memory\") }}"
-                        operator: GreaterThan
-                        value: "{{ team_budget.budget.\"requests.memory\" }}"
+          evaluation:
+            background:
+              enabled: false
+          matchConstraints:
+            objectSelector:
+              matchExpressions:
+              - key: team
+                operator: In
+                values: ["${schema.spec.teamName}"]
+            resourceRules:
+            - apiGroups: [""]
+              apiVersions: ["v1"]
+              operations: ["CREATE", "UPDATE"]
+              resources: ["resourcequotas"]
+          validationActions:
+          - Deny
+          variables:
+          - name: other_team_quotas
+            expression: >-
+              dyn(resource.List("v1", "resourcequotas", "").items).filter(q, q.metadata.?labels.orValue({})[?'team'].orValue('') == "${schema.spec.teamName}" && q.metadata.name != object.metadata.name)
+          - name: current_cpu_usage
+            expression: >-
+              dyn(variables.other_team_quotas).map(q, quantity(string(q.spec.?hard.orValue({})[?'requests.cpu'].orValue('0'))).asApproximateFloat()).sum()
+          - name: current_mem_usage
+            expression: >-
+              dyn(variables.other_team_quotas).map(q, quantity(string(q.spec.?hard.orValue({})[?'requests.memory'].orValue('0'))).asApproximateFloat()).sum()
+          - name: requested_cpu
+            expression: >-
+              quantity(string(object.spec.hard['requests.cpu'])).asApproximateFloat()
+          - name: requested_mem
+            expression: >-
+              quantity(string(object.spec.hard['requests.memory'])).asApproximateFloat()
+          - name: budget_cpu
+            expression: >-
+              quantity("${schema.spec.budget['requests.cpu']}").asApproximateFloat()
+          - name: budget_mem
+            expression: >-
+              quantity("${schema.spec.budget['requests.memory']}").asApproximateFloat()
+          validations:
+          - expression: >-
+              dyn(variables.requested_cpu) + variables.current_cpu_usage <= variables.budget_cpu
+            messageExpression: >-
+              "Team budget exceeded for '${schema.spec.teamName}'. CPU request would bring total to " + string(dyn(variables.requested_cpu) + variables.current_cpu_usage) + ", but budget is ${schema.spec.budget['requests.cpu']}."
+          - expression: >-
+              dyn(variables.requested_mem) + variables.current_mem_usage <= variables.budget_mem
+            messageExpression: >-
+              "Team budget exceeded for '${schema.spec.teamName}'. Memory request would bring total to " + string(dyn(variables.requested_mem) + variables.current_mem_usage) + ", but budget is ${schema.spec.budget['requests.memory']}."

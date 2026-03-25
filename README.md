@@ -8,7 +8,7 @@ This demo creates a `ClusterResourceQuotas` custom resource (via kro) that:
 
 1. Discovers all `ResourceQuota` objects labeled for a team across namespaces
 2. Aggregates CPU and memory usage in the status
-3. Deploys a Kyverno `ClusterPolicy` that validates new `ResourceQuota` objects against the team's budget
+3. Deploys a Kyverno `ValidatingPolicy` that validates new `ResourceQuota` objects against the team's budget
 
 ## Prerequisites
 
@@ -23,7 +23,7 @@ This demo creates a `ClusterResourceQuotas` custom resource (via kro) that:
 make cluster
 
 # Optionally set versions
-make cluster KRO_VERSION=0.9.0-rc1 KYVERNO_VERSION=3.7.1
+make cluster KRO_VERSION=0.9.0 KYVERNO_VERSION=3.7.1
 
 # Deploy the demo resources
 make demo-setup
